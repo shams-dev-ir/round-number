@@ -1,0 +1,124 @@
+name: Deploy
+
+# Builds the standalone bundle in CI and ships it to the VPS over SSH.
+# The server never installs dependencies or compiles anything — it only
+# receives files and restarts the service.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  # Where the app lives on the server. Overridden by the DEPLOY_PATH secret.
+  APP_DIR: ${{ secrets.DEPLOY_PATH || '/var/www/rondix' }}
+  SERVICE: ${{ secrets.SERVICE_NAME || 'rondix' }}
+  KEEP_RELEASES: 5
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+      # `output: "standalone"` deliberately leaves out public/ and .next/static,
+      # since a CDN would normally serve them. We have no CDN, so fold them back
+      # in and let the bundled server.js serve them.
+      - name: Assemble standalone bundle
+        working-directory: frontend
+        run: |
+          set -euo pipefail
+          rm -rf ../release
+          cp -r .next/standalone ../release
+          mkdir -p ../release/.next
+          cp -r .next/static ../release/.next/static
+          if [ -d public ]; then cp -r public ../release/public; fi
+          test -f ../release/server.js
+          echo "${{ github.sha }}" > ../release/RELEASE_SHA
+          du -sh ../release
+
+      - name: Configure SSH
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          if [ -n "${{ secrets.SSH_KNOWN_HOSTS }}" ]; then
+            # Pinned host key — preferred, protects against MITM.
+            echo "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          else
+            # Trust-on-first-use fallback so the first deploy isn't blocked.
+            ssh-keyscan -p "${{ secrets.SSH_PORT || 22 }}" -H "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+          fi
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Upload release
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
+        run: |
+          set -euo pipefail
+          RELEASE="$APP_DIR/releases/${{ github.sha }}"
+          ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+            "mkdir -p '$RELEASE'"
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/id_deploy -p $SSH_PORT" \
+            release/ "$SSH_USER@$SSH_HOST:$RELEASE/"
+
+      # Swapping a symlink makes the cutover atomic: a half-finished upload can
+      # never be the live version, and rollback is just re-pointing the link.
+      - name: Activate and restart
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" bash -euo pipefail <<EOF
+            ln -sfn "$APP_DIR/releases/${{ github.sha }}" "$APP_DIR/current.tmp"
+            mv -Tf "$APP_DIR/current.tmp" "$APP_DIR/current"
+            sudo systemctl restart "$SERVICE"
+
+            # Keep the last $KEEP_RELEASES releases so a rollback is possible.
+            cd "$APP_DIR/releases"
+            ls -1dt */ | tail -n +$((KEEP_RELEASES + 1)) | xargs -r rm -rf
+          EOF
+
+      - name: Health check
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" bash -euo pipefail <<EOF
+            for i in \$(seq 1 20); do
+              code=\$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/ || true)
+              if [ "\$code" = "200" ]; then echo "OK after \${i}s"; exit 0; fi
+              sleep 1
+            done
+            echo "App did not return 200 on 127.0.0.1:3000"
+            sudo systemctl status "$SERVICE" --no-pager --lines 40 || true
+            exit 1
+          EOF

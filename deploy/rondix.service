@@ -1,0 +1,35 @@
+[Unit]
+Description=Rondix — Next.js frontend
+After=network.target
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+
+# A symlink. systemd resolves it at start, so restarting the unit is what
+# actually promotes a newly uploaded release.
+WorkingDirectory=/var/www/rondix/current
+
+Environment=NODE_ENV=production
+Environment=PORT=3000
+# Bind to loopback only — nginx is the sole public entry point.
+Environment=HOSTNAME=127.0.0.1
+
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=3
+
+# Basic hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/www/rondix
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rondix
+
+[Install]
+WantedBy=multi-user.target

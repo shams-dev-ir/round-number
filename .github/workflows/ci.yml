@@ -21,9 +21,9 @@ jobs:
     name: Typecheck, lint and build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -31,6 +31,12 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      # `LayoutProps` / `PageProps` are globals that Next generates into
+      # .next/types. On a clean checkout they don't exist yet, so tsc would
+      # fail with "Cannot find name 'PageProps'" before anything is built.
+      - name: Generate route types
+        run: npx next typegen
 
       - name: Typecheck
         run: npx tsc --noEmit

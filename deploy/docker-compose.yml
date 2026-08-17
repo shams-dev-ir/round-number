@@ -1,0 +1,33 @@
+# Rondix frontend — deployed to /opt/rondix/docker-compose.yml on the server.
+#
+# Deliberately mirrors nasag-frontend / farkesht-frontend / behyarzist-frontend
+# already on this box: no published host port, joined to the shared `proxy`
+# network, reached by container name from the nginx-proxy container.
+#
+#   docker compose pull && docker compose up -d
+
+services:
+  rondix-frontend:
+    # Set by CI to the exact commit tag; :latest is only the local fallback.
+    image: ${RONDIX_IMAGE:-ghcr.io/shams-dev-ir/round-number:latest}
+    container_name: rondix-frontend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      # Must be 0.0.0.0, not 127.0.0.1: the proxy reaches this container across
+      # the docker network, so binding to loopback would make it unreachable.
+      HOSTNAME: "0.0.0.0"
+    networks:
+      - proxy
+    # No `ports:` on purpose. Publishing 3000 would collide with the other
+    # frontends and expose the app outside the proxy.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  proxy:
+    external: true

@@ -1,0 +1,14 @@
+node_modules
+.next
+.git
+.github
+.claude
+.git-old-scaffold
+npm-debug.log*
+README.md
+Dockerfile
+.dockerignore
+.env
+.env.*
+*.tsbuildinfo
+coverage

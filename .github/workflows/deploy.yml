@@ -1,8 +1,8 @@
 name: Deploy
 
-# Builds the standalone bundle in CI and ships it to the VPS over SSH.
-# The server never installs dependencies or compiles anything — it only
-# receives files and restarts the service.
+# Builds a container image in CI, publishes it to GHCR, then tells the server
+# to pull and swap. The server never builds — it only pulls an image and
+# restarts one compose project, so nothing else running on that box is touched.
 on:
   push:
     branches: [main]
@@ -13,29 +13,68 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Where the app lives on the server. Overridden by the DEPLOY_PATH secret.
-  APP_DIR: ${{ secrets.DEPLOY_PATH || '/var/www/rondix' }}
-  SERVICE: ${{ secrets.SERVICE_NAME || 'rondix' }}
-  KEEP_RELEASES: 5
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  APP_DIR: ${{ secrets.DEPLOY_PATH || '/opt/rondix' }}
+  CONTAINER: rondix-frontend
+  PROXY_CONTAINER: nginx-proxy
 
 jobs:
+  build:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image reference
+        id: meta
+        run: |
+          # Lowercase: GHCR rejects uppercase in repository names.
+          repo=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          echo "image=${{ env.REGISTRY }}/${repo}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:latest
+            ${{ steps.meta.outputs.image }}:${{ github.sha }}
+          # Layer cache lives in the registry, so an unchanged dependency tree
+          # skips `npm ci` entirely on later builds.
+          cache-from: type=registry,ref=${{ steps.meta.outputs.image }}:buildcache
+          cache-to: type=registry,ref=${{ steps.meta.outputs.image }}:buildcache,mode=max
+
   deploy:
-    name: Build and deploy
+    name: Release to server
+    needs: build
     runs-on: ubuntu-latest
     environment: production
-
     steps:
-      # Fail fast with a readable message instead of letting ssh-keyscan die on
-      # an empty hostname further down.
       - name: Check deployment secrets are configured
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_USER: ${{ secrets.SSH_USER }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
         run: |
-          # Written as if-blocks on purpose: `[ test ] && assign` returns 1 when
-          # the test is false, which under `set -e` would abort the step exactly
-          # when every secret is correctly set.
+          # if-blocks, not `[ test ] && assign`: the latter returns 1 when the
+          # test is false, which under `set -e` aborts exactly when every
+          # secret is correctly set.
           missing=""
           if [ -z "$SSH_HOST" ]; then missing="$missing SSH_HOST"; fi
           if [ -z "$SSH_USER" ]; then missing="$missing SSH_USER"; fi
@@ -43,42 +82,12 @@ jobs:
           if [ -n "$missing" ]; then
             echo "::error::Missing repository secrets:$missing"
             echo "Add them under Settings > Secrets and variables > Actions."
-            echo "See DEPLOY.md step 5 for the full list and how to generate the key."
+            echo "See DEPLOY.md for the full list."
             exit 1
           fi
           echo "All required secrets are present."
 
       - uses: actions/checkout@v7
-
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Install dependencies
-        working-directory: frontend
-        run: npm ci
-
-      - name: Build
-        working-directory: frontend
-        run: npm run build
-
-      # `output: "standalone"` deliberately leaves out public/ and .next/static,
-      # since a CDN would normally serve them. We have no CDN, so fold them back
-      # in and let the bundled server.js serve them.
-      - name: Assemble standalone bundle
-        working-directory: frontend
-        run: |
-          set -euo pipefail
-          rm -rf ../release
-          cp -r .next/standalone ../release
-          mkdir -p ../release/.next
-          cp -r .next/static ../release/.next/static
-          if [ -d public ]; then cp -r public ../release/public; fi
-          test -f ../release/server.js
-          echo "${{ github.sha }}" > ../release/RELEASE_SHA
-          du -sh ../release
 
       - name: Configure SSH
         run: |
@@ -87,45 +96,51 @@ jobs:
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_deploy
           chmod 600 ~/.ssh/id_deploy
           if [ -n "${{ secrets.SSH_KNOWN_HOSTS }}" ]; then
-            # Pinned host key — preferred, protects against MITM.
             echo "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
           else
-            # Trust-on-first-use fallback so the first deploy isn't blocked.
             ssh-keyscan -p "${{ secrets.SSH_PORT || 22 }}" -H "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
           fi
           chmod 600 ~/.ssh/known_hosts
 
-      - name: Upload release
+      - name: Sync compose file
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_USER: ${{ secrets.SSH_USER }}
           SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
         run: |
           set -euo pipefail
-          RELEASE="$APP_DIR/releases/${{ github.sha }}"
-          ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
-            "mkdir -p '$RELEASE'"
-          rsync -az --delete \
-            -e "ssh -i ~/.ssh/id_deploy -p $SSH_PORT" \
-            release/ "$SSH_USER@$SSH_HOST:$RELEASE/"
+          scp -i ~/.ssh/id_deploy -P "$SSH_PORT" \
+            deploy/docker-compose.yml "$SSH_USER@$SSH_HOST:$APP_DIR/docker-compose.yml"
 
-      # Swapping a symlink makes the cutover atomic: a half-finished upload can
-      # never be the live version, and rollback is just re-pointing the link.
-      - name: Activate and restart
+      - name: Pull and restart
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_USER: ${{ secrets.SSH_USER }}
           SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
+          IMAGE: ${{ needs.build.outputs.image }}:${{ github.sha }}
         run: |
           set -euo pipefail
           ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" bash -euo pipefail <<EOF
-            ln -sfn "$APP_DIR/releases/${{ github.sha }}" "$APP_DIR/current.tmp"
-            mv -Tf "$APP_DIR/current.tmp" "$APP_DIR/current"
-            sudo systemctl restart "$SERVICE"
+            cd "$APP_DIR"
+            # Pin the exact commit image so a rollback is just re-running an
+            # older workflow, and so restarts can't silently pick up a new build.
+            echo "RONDIX_IMAGE=$IMAGE" > .env
 
-            # Keep the last $KEEP_RELEASES releases so a rollback is possible.
-            cd "$APP_DIR/releases"
-            ls -1dt */ | tail -n +$((KEEP_RELEASES + 1)) | xargs -r rm -rf
+            # GHCR packages are private by default, so authenticate for the pull.
+            # This uses the workflow's own short-lived token and is discarded
+            # immediately after, leaving no standing credential on the server.
+            echo '${{ secrets.GITHUB_TOKEN }}' \
+              | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+            trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+
+            docker compose pull
+            docker compose up -d --remove-orphans
+
+            # Only ever clean up our own old images — other projects share this
+            # docker daemon, so a blanket prune is not ours to run.
+            docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' \
+              | awk '\$1 ~ /round-number/ && \$1 !~ /(latest|buildcache)\$/ {print \$2}' \
+              | tail -n +4 | xargs -r docker rmi -f 2>/dev/null || true
           EOF
 
       - name: Health check
@@ -136,16 +151,38 @@ jobs:
         run: |
           set -euo pipefail
           ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" bash -euo pipefail <<EOF
-            # The port is assigned at setup time from whatever was free on this
-            # server, so read it back rather than assuming 3000.
-            APP_PORT=\$(sed -n 's/^PORT=//p' /etc/rondix.env)
-            : "\${APP_PORT:?PORT missing from /etc/rondix.env — re-run server-setup.sh}"
-            for i in \$(seq 1 20); do
-              code=\$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:\${APP_PORT}/" || true)
-              if [ "\$code" = "200" ]; then echo "OK on port \${APP_PORT} after \${i}s"; exit 0; fi
-              sleep 1
+            # The container publishes no host port, and the nginx image has no
+            # curl to probe with, so rely on the HEALTHCHECK baked into our own
+            # image and read the status docker already tracks.
+            for i in \$(seq 1 40); do
+              status=\$(docker inspect --format '{{.State.Health.Status}}' $CONTAINER 2>/dev/null || echo missing)
+              case "\$status" in
+                healthy)   echo "container healthy after \$((i*3))s"; exit 0 ;;
+                unhealthy) echo "container reported unhealthy"; break ;;
+              esac
+              sleep 3
             done
-            echo "App did not return 200 on 127.0.0.1:\${APP_PORT}"
-            sudo systemctl status "$SERVICE" --no-pager --lines 40 || true
+            echo "Container did not become healthy (last status: \${status:-unknown})"
+            docker ps --filter "name=$CONTAINER"
+            docker logs --tail 60 $CONTAINER || true
             exit 1
           EOF
+
+      - name: Verify the site answers through the proxy
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SITE_HOST: ${{ secrets.SITE_HOST }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SITE_HOST" ]; then
+            echo "SITE_HOST secret not set — skipping public check."
+            exit 0
+          fi
+          for i in $(seq 1 10); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://$SITE_HOST/" || true)
+            if [ "$code" = "200" ]; then echo "$SITE_HOST returned 200"; exit 0; fi
+            echo "  attempt $i: got '$code'"
+            sleep 3
+          done
+          echo "::error::$SITE_HOST did not return 200 — check the vhost in /opt/nginx/conf.d/rondix.conf"
+          exit 1

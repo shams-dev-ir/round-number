@@ -11,10 +11,10 @@ Group=deploy
 # actually promotes a newly uploaded release.
 WorkingDirectory=/var/www/rondix/current
 
-Environment=NODE_ENV=production
-Environment=PORT=3000
-# Bind to loopback only — nginx is the sole public entry point.
-Environment=HOSTNAME=127.0.0.1
+# Written by server-setup.sh. Holds PORT, which is chosen at setup time from
+# whatever is actually free on this machine, plus HOSTNAME=127.0.0.1 so the app
+# binds to loopback only and nginx stays the sole public entry point.
+EnvironmentFile=/etc/rondix.env
 
 ExecStart=/usr/bin/node server.js
 Restart=always

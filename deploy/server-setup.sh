@@ -63,8 +63,30 @@ fi
 
 if [[ "$node_major" -ge 20 ]]; then
   echo "==> Node $(node -v) already installed — skipping NodeSource setup"
+elif [[ "$node_major" -gt 0 ]]; then
+  # Something else on this server is already using this Node. Replacing the
+  # system runtime underneath a running project is not a call this script gets
+  # to make silently.
+  cat >&2 <<MSG
+
+Node v${node_major} is installed and other projects on this server may depend
+on it. This script will not upgrade it for you.
+
+Rondix needs Node 20 or newer. Pick one:
+
+  a) Upgrade system Node yourself, after checking your other apps tolerate it:
+       curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash -
+       apt-get install -y nodejs
+
+  b) Leave system Node alone and install a private copy just for Rondix:
+       curl -fsSL https://fnm.vercel.app/install | bash
+       fnm install ${NODE_MAJOR}
+     then point ExecStart in /etc/systemd/system/rondix.service at that binary.
+
+MSG
+  exit 1
 else
-  echo "==> Installing Node ${NODE_MAJOR} from NodeSource"
+  echo "==> No Node found — installing Node ${NODE_MAJOR} from NodeSource"
   # Drop any prior NodeSource config, whichever layout it used, so exactly one
   # entry with one keyring remains.
   rm -f /etc/apt/sources.list.d/nodesource.list \
@@ -97,6 +119,45 @@ touch "/home/$DEPLOY_USER/.ssh/authorized_keys"
 chmod 600 "/home/$DEPLOY_USER/.ssh/authorized_keys"
 chown "$DEPLOY_USER:$DEPLOY_USER" "/home/$DEPLOY_USER/.ssh/authorized_keys"
 
+# This box runs other projects, so never assume a port is ours to take. Pick
+# the first free one and record it where both systemd and the deploy workflow
+# can read it back.
+echo "==> Selecting a free port"
+port_in_use() {
+  ss -tlnH "sport = :$1" 2>/dev/null | grep -q . && return 0
+  return 1
+}
+
+APP_PORT=""
+if [[ -f /etc/rondix.env ]]; then
+  # Re-running setup: keep the port we already published to nginx and CI.
+  APP_PORT="$(sed -n 's/^PORT=//p' /etc/rondix.env)"
+  echo "    reusing previously assigned port ${APP_PORT}"
+fi
+
+if [[ -z "$APP_PORT" ]]; then
+  for candidate in 3000 3100 3200 3300 4010 4020 5010 5020; do
+    if ! port_in_use "$candidate"; then
+      APP_PORT="$candidate"
+      break
+    fi
+    echo "    port $candidate is taken by another project, skipping"
+  done
+fi
+
+if [[ -z "$APP_PORT" ]]; then
+  echo "No free port found in the candidate list." >&2
+  exit 1
+fi
+echo "    using port ${APP_PORT}"
+
+cat > /etc/rondix.env <<EOF
+NODE_ENV=production
+PORT=${APP_PORT}
+HOSTNAME=127.0.0.1
+EOF
+chmod 644 /etc/rondix.env
+
 echo "==> Installing systemd unit"
 cp "$(dirname "$0")/rondix.service" /etc/systemd/system/rondix.service
 systemctl daemon-reload
@@ -111,10 +172,32 @@ chmod 440 /etc/sudoers.d/rondix-deploy
 visudo -cf /etc/sudoers.d/rondix-deploy
 
 echo "==> Configuring nginx for ${SERVER_NAME}"
-sed "s/SERVER_NAME/${SERVER_NAME}/g" "$(dirname "$0")/nginx.conf" > /etc/nginx/sites-available/rondix
+
+# Refuse to hijack a hostname another project already answers for.
+existing="$(grep -rlE "^[[:space:]]*server_name[[:space:]].*(^|[[:space:]])${SERVER_NAME}([[:space:]]|;)" \
+  /etc/nginx/sites-enabled/ 2>/dev/null | grep -v '/rondix$' || true)"
+if [[ -n "$existing" ]]; then
+  echo "server_name ${SERVER_NAME} is already served by:" >&2
+  echo "$existing" >&2
+  echo "Pick a different hostname so the existing site keeps working." >&2
+  exit 1
+fi
+
+sed -e "s/SERVER_NAME/${SERVER_NAME}/g" -e "s/APP_PORT/${APP_PORT}/g" \
+  "$(dirname "$0")/nginx.conf" > /etc/nginx/sites-available/rondix
 ln -sfn /etc/nginx/sites-available/rondix /etc/nginx/sites-enabled/rondix
-rm -f /etc/nginx/sites-enabled/default
-nginx -t
+
+# Note: sites-enabled/default is intentionally left alone — other projects on
+# this server may depend on it as the catch-all server block.
+
+# If our block is broken, roll it back rather than leaving nginx unreloadable
+# for every other site on the box.
+if ! nginx -t; then
+  echo "nginx rejected the new config — removing it and leaving nginx untouched" >&2
+  rm -f /etc/nginx/sites-enabled/rondix
+  nginx -t
+  exit 1
+fi
 systemctl reload nginx
 
 echo

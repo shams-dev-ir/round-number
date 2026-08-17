@@ -136,12 +136,16 @@ jobs:
         run: |
           set -euo pipefail
           ssh -i ~/.ssh/id_deploy -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" bash -euo pipefail <<EOF
+            # The port is assigned at setup time from whatever was free on this
+            # server, so read it back rather than assuming 3000.
+            APP_PORT=\$(sed -n 's/^PORT=//p' /etc/rondix.env)
+            : "\${APP_PORT:?PORT missing from /etc/rondix.env — re-run server-setup.sh}"
             for i in \$(seq 1 20); do
-              code=\$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/ || true)
-              if [ "\$code" = "200" ]; then echo "OK after \${i}s"; exit 0; fi
+              code=\$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:\${APP_PORT}/" || true)
+              if [ "\$code" = "200" ]; then echo "OK on port \${APP_PORT} after \${i}s"; exit 0; fi
               sleep 1
             done
-            echo "App did not return 200 on 127.0.0.1:3000"
+            echo "App did not return 200 on 127.0.0.1:\${APP_PORT}"
             sudo systemctl status "$SERVICE" --no-pager --lines 40 || true
             exit 1
           EOF

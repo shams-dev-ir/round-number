@@ -13,6 +13,11 @@
 
 set -euo pipefail
 
+# Accepts more than one hostname. Useful because traffic normally arrives via
+# the CDN, so having a second name that points straight at this box gives a way
+# to tell "origin is broken" apart from "CDN is misconfigured".
+#   bash register-site.sh roundnumber.8ads8.ir 62.106.95.197.nip.io
+SERVER_NAMES="$*"
 SERVER_NAME="${1:-}"
 APP_DIR=/opt/rondix
 PROXY_CONTAINER=nginx-proxy
@@ -22,8 +27,8 @@ CONTAINER_NAME=rondix-frontend
 here="$(cd "$(dirname "$0")" && pwd)"
 
 if [[ -z "$SERVER_NAME" ]]; then
-  echo "usage: sudo bash register-site.sh <domain>" >&2
-  echo "example: sudo bash register-site.sh 62.106.95.197.nip.io" >&2
+  echo "usage: sudo bash register-site.sh <domain> [more-domains...]" >&2
+  echo "example: sudo bash register-site.sh roundnumber.8ads8.ir 62.106.95.197.nip.io" >&2
   exit 1
 fi
 
@@ -60,13 +65,15 @@ if [[ ! -d "$PROXY_CONF_DIR" ]]; then
 fi
 
 # Refuse to shadow a hostname another site already answers for.
-clash="$(grep -rlE "^[[:space:]]*server_name[[:space:]].*(^|[[:space:]])${SERVER_NAME}([[:space:]]|;)" \
-  "$PROXY_CONF_DIR" 2>/dev/null | grep -v '/rondix\.conf$' || true)"
-if [[ -n "$clash" ]]; then
-  echo "server_name ${SERVER_NAME} is already served by:" >&2
-  echo "$clash" >&2
-  exit 1
-fi
+for name in $SERVER_NAMES; do
+  clash="$(grep -rlE "^[[:space:]]*server_name[[:space:]].*(^|[[:space:]])${name}([[:space:]]|;)" \
+    "$PROXY_CONF_DIR" 2>/dev/null | grep -v '/rondix\.conf$' || true)"
+  if [[ -n "$clash" ]]; then
+    echo "server_name ${name} is already served by:" >&2
+    echo "$clash" >&2
+    exit 1
+  fi
+done
 
 echo "    docker ok, network '$PROXY_NETWORK' ok, proxy '$PROXY_CONTAINER' running"
 
@@ -99,8 +106,8 @@ visudo -cf /etc/sudoers.d/rondix-deploy
 
 # ----------------------------------------------------------------- vhost ----
 
-echo "==> Adding vhost for ${SERVER_NAME}"
-sed "s/SERVER_NAME/${SERVER_NAME}/g" "$here/rondix.conf" > "$PROXY_CONF_DIR/rondix.conf"
+echo "==> Adding vhost for: ${SERVER_NAMES}"
+sed -e "s/SERVER_NAMES/${SERVER_NAMES}/g" -e "s/SERVER_NAME/${SERVER_NAME}/g" "$here/rondix.conf" > "$PROXY_CONF_DIR/rondix.conf"
 
 # If our vhost is bad, take it back out rather than leaving the proxy unable to
 # reload for every other site on the box.
@@ -116,7 +123,7 @@ echo "    vhost installed and proxy reloaded"
 
 echo
 echo "==> Done."
-echo "  Site will answer on: http://${SERVER_NAME}"
+for n in $SERVER_NAMES; do echo "  Site will answer on: http://$n"; done
 echo
 echo "  Next:"
 echo "   1. Add the CI public key to /home/deploy/.ssh/authorized_keys"

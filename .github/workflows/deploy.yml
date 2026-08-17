@@ -15,7 +15,10 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  APP_DIR: ${{ secrets.DEPLOY_PATH || '/opt/rondix' }}
+  # Plain value, not a secret: a filesystem path is not sensitive, and holding
+  # it as a secret got it masked as *** in the logs, which hid the real cause
+  # of a failed upload. Must match the APP_DIR in deploy/register-site.sh.
+  APP_DIR: /opt/rondix
   CONTAINER: rondix-frontend
   PROXY_CONTAINER: nginx-proxy
 
